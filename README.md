@@ -2,7 +2,9 @@
 
 Modelador 3D que roda no navegador, com fluxo de trabalho de CAD: quatro vistas (Superior, Perspectiva, Frontal, Direita), linha de comando, camadas, snaps de objeto, gumball, desfazer e refazer.
 
-**Abrir:** https://alefe7z.github.io/3dvect/
+**Abrir no navegador:** https://alefe7z.github.io/3dvect/
+
+**Baixar para Windows:** [Releases → ultima-versao](https://github.com/alefe7z/3dvect/releases/tag/ultima-versao) (instalador ou versão portátil, funciona sem internet)
 
 ## O que faz
 
@@ -22,3 +24,10 @@ Coordenadas: `10,20,5` absoluta, `r10,0` relativa, `30<45` polar; um número soz
 Enter vazio repete o último comando, Esc cancela. Botão direito gira a perspectiva; roda dá zoom.
 
 Arquivo único (`index.html`), sem instalação. Usa three.js, three-bvh-csg, fflate e rhino3dm via CDN.
+
+## Versão para Windows
+
+A pasta `desktop/` empacota o mesmo `index.html` com Electron, com todas as bibliotecas e fontes embutidas.
+A cada push na branch `main`, o GitHub Actions (`.github/workflows/compilar-exe.yml`) compila o instalador e a versão portátil e publica na release `ultima-versao`.
+
+Para compilar no seu computador: `cd desktop && npm ci && npm run dist` (os .exe saem em `desktop/dist`). Para só abrir o app: `npm start`.

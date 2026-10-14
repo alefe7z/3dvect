@@ -1,0 +1,52 @@
+{
+  "name": "vertice-3d",
+  "productName": "Vertice 3D",
+  "version": "1.0.0",
+  "description": "Modelador 3D com fluxo de trabalho de CAD",
+  "author": "alefe7z",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "prepare-app": "node prepare.mjs",
+    "start": "node prepare.mjs && electron .",
+    "dist": "node prepare.mjs && electron-builder --win portable nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "@fontsource/ibm-plex-mono": "5.1.0",
+    "@fontsource/ibm-plex-sans-condensed": "5.1.0",
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8",
+    "fflate": "0.8.2",
+    "rhino3dm": "8.4.0",
+    "three": "0.160.0",
+    "three-bvh-csg": "0.0.16",
+    "three-mesh-bvh": "0.7.3"
+  },
+  "build": {
+    "appId": "io.github.alefe7z.vertice3d",
+    "productName": "Vertice 3D",
+    "copyright": "alefe7z",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "app/**/*"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.png"
+    },
+    "portable": {
+      "artifactName": "Vertice-3D-${version}-portatil.exe"
+    },
+    "nsis": {
+      "artifactName": "Vertice-3D-${version}-instalador.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Vértice 3D"
+    }
+  }
+}

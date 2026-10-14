@@ -1,0 +1,58 @@
+name: Compilar .exe (Windows)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compilar-exe
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Compilar instalador e versão portátil
+        run: npm run dist
+
+      - name: Guardar os .exe como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vertice-3D-Windows
+          path: desktop/dist/*.exe
+          if-no-files-found: error
+
+      - name: Publicar na release "ultima-versao"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete ultima-versao --cleanup-tag --yes || true
+          sleep 3
+          gh release create ultima-versao dist/*.exe \
+            --target "$GITHUB_SHA" \
+            --title "Vértice 3D para Windows (última versão)" \
+            --notes "Compilado automaticamente a partir do commit ${GITHUB_SHA::7}.
+
+          - **Vertice-3D-…-instalador.exe**: instala no computador e cria atalho no menu Iniciar.
+          - **Vertice-3D-…-portatil.exe**: roda direto, sem instalar (bom para pendrive).
+
+          Funciona sem internet. Como o executável não tem assinatura digital, o Windows pode mostrar \"O Windows protegeu o computador\": clique em **Mais informações → Executar assim mesmo**."
