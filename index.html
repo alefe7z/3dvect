@@ -220,7 +220,7 @@ tr.cur .dot{background:var(--accent);border-color:var(--accent)}
     <span id="selinfo">Nenhum objeto selecionado</span>
   </footer>
 </div>
-<input id="filein" type="file" hidden accept=".json,.obj,.stl,.glb,.gltf,.ply,.3dm">
+<input id="filein" type="file" hidden accept=".json,.obj,.stl,.3mf,.glb,.gltf,.ply,.3dm">
 <div id="toast" hidden></div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/","three-mesh-bvh":"https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/src/index.js","three-bvh-csg":"https://cdn.jsdelivr.net/npm/three-bvh-csg@0.0.16/src/index.js","fflate":"https://cdn.jsdelivr.net/npm/fflate@0.8.2/esm/browser.js"}}</script>
 <script type="module">
@@ -238,6 +238,7 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
 import { Brush, Evaluator, ADDITION, SUBTRACTION, INTERSECTION } from 'three-bvh-csg';
 import { zipSync } from 'fflate';
 
@@ -696,6 +697,113 @@ function bilinearSrf(a, b, c, d, n = 16) {
   const arr = []; gridTris(arr, rows, false, false); return geomFromTris(arr);
 }
 
+/* =========================================================
+   Arredondamento
+   ========================================================= */
+const V2 = (x, y) => new THREE.Vector2(x, y);
+function area2(P) { let a = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p.x * q.y - q.x * p.y; } return a / 2; }
+/* arredonda cantos vivos de um polígono 2D fechado (sentido anti-horário) */
+function filletPolygon2D(P, r, minTurnDeg = 8) {
+  if (!(r > 0)) return P.map(p => p.clone());
+  const n = P.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const prev = P[(i - 1 + n) % n], cur = P[i], next = P[(i + 1) % n];
+    const v1 = prev.clone().sub(cur), v2 = next.clone().sub(cur);
+    const l1 = v1.length(), l2 = v2.length();
+    if (l1 < 1e-9 || l2 < 1e-9) { out.push(cur.clone()); continue; }
+    v1.divideScalar(l1); v2.divideScalar(l2);
+    const ang = Math.acos(THREE.MathUtils.clamp(v1.dot(v2), -1, 1));
+    if (Math.PI - ang < minTurnDeg * DEG) { out.push(cur.clone()); continue; }
+    let t = r / Math.tan(ang / 2);
+    t = Math.min(t, 0.499 * Math.min(l1, l2));
+    const rr = t * Math.tan(ang / 2);
+    const p1 = cur.clone().addScaledVector(v1, t), p2 = cur.clone().addScaledVector(v2, t);
+    const bis = v1.clone().add(v2).normalize();
+    const c = cur.clone().addScaledVector(bis, rr / Math.sin(ang / 2));
+    let a1 = Math.atan2(p1.y - c.y, p1.x - c.x), a2 = Math.atan2(p2.y - c.y, p2.x - c.x);
+    let d = a2 - a1; while (d > Math.PI) d -= TAU; while (d < -Math.PI) d += TAU;
+    const steps = Math.max(3, Math.ceil(Math.abs(d) / (Math.PI / 2) * 10));
+    for (let k = 0; k <= steps; k++) { const a = a1 + d * k / steps; out.push(V2(c.x + rr * Math.cos(a), c.y + rr * Math.sin(a))); }
+  }
+  return out;
+}
+/* desloca um polígono 2D anti-horário para dentro (d > 0) */
+function offsetPolygon2D(P, d) {
+  if (!d) return P.map(p => p.clone());
+  const n = P.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const prev = P[(i - 1 + n) % n], cur = P[i], next = P[(i + 1) % n];
+    const e1 = cur.clone().sub(prev), e2 = next.clone().sub(cur);
+    const n1 = V2(-e1.y, e1.x), n2 = V2(-e2.y, e2.x);
+    if (n1.lengthSq() < 1e-18) n1.copy(n2); if (n2.lengthSq() < 1e-18) n2.copy(n1);
+    n1.normalize(); n2.normalize();
+    const m = n1.clone().add(n2); if (m.lengthSq() < 1e-12) m.copy(n1); m.normalize();
+    out.push(cur.clone().addScaledVector(m, d / Math.max(0.25, m.dot(n1))));
+  }
+  return out;
+}
+/* sólido prismático a partir de um perfil 2D, com raio nas arestas verticais (rv) e no topo/base (rt) */
+function makePrism(prof, h, rv = 0, rt = 0, mArr = null) {
+  let P = prof.map(q => V2(q[0], q[1]));
+  if (area2(P) < 0) P.reverse();
+  P = filletPolygon2D(P, rv);
+  const A0 = area2(P);
+  rt = Math.max(0, Math.min(rt, h / 2 * 0.999));
+  // reduz o raio de topo/base se o perfil deslocado colapsar
+  for (let tries = 0; rt > 0 && tries < 12; tries++) {
+    const ins = offsetPolygon2D(P, rt);
+    if (area2(ins) > A0 * 0.02 && selfConsistent(P, ins)) break;
+    rt *= 0.7;
+  }
+  const m = mArr ? new THREE.Matrix4().fromArray(mArr) : new THREE.Matrix4();
+  const ring = (inset, z) => { const R = offsetPolygon2D(P, inset).map(q => V(q.x, q.y, z).applyMatrix4(m)); R.push(R[0].clone()); return R; };
+  const rows = [];
+  if (rt > 0) {
+    const st = 10;
+    for (let k = 0; k <= st; k++) { const f = Math.PI / 2 * k / st; rows.push(ring(rt * (1 - Math.sin(f)), rt * (1 - Math.cos(f)))); }
+    for (let k = st; k >= 0; k--) { const f = Math.PI / 2 * k / st; rows.push(ring(rt * (1 - Math.sin(f)), h - rt * (1 - Math.cos(f)))); }
+  } else rows.push(ring(0, 0), ring(0, h));
+  const arr = [];
+  gridTris(arr, rows, false, false);
+  const nz = V(0, 0, 1).transformDirection(m);
+  capTris(arr, rows[0], nz, true);
+  capTris(arr, rows[rows.length - 1], nz, false);
+  return { geom: orientOutward(geomFromTris(arr)), rt };
+}
+function selfConsistent(P, Q) {
+  // o deslocamento não pode inverter a direção de nenhuma aresta
+  for (let i = 0; i < P.length; i++) {
+    const a = P[(i + 1) % P.length].clone().sub(P[i]), b = Q[(i + 1) % Q.length].clone().sub(Q[i]);
+    if (a.dot(b) < -0.02 * a.lengthSq()) return false;
+  }
+  return true;
+}
+/* cantos de polilinha 3D: arredondar (mode 'fillet') ou chanfrar ('chamfer') */
+function cornerPolyline(pts, closed, r, mode) {
+  const n = pts.length, out = [];
+  for (let i = 0; i < n; i++) {
+    const cur = pts[i];
+    if (!closed && (i === 0 || i === n - 1)) { out.push(cur.clone()); continue; }
+    const prev = pts[(i - 1 + n) % n], next = pts[(i + 1) % n];
+    const v1 = prev.clone().sub(cur), v2 = next.clone().sub(cur), l1 = v1.length(), l2 = v2.length();
+    if (l1 < 1e-9 || l2 < 1e-9) { out.push(cur.clone()); continue; }
+    v1.divideScalar(l1); v2.divideScalar(l2);
+    const ang = Math.acos(THREE.MathUtils.clamp(v1.dot(v2), -1, 1));
+    if (Math.PI - ang < 2 * DEG) { out.push(cur.clone()); continue; }
+    let t = mode === 'chamfer' ? r : r / Math.tan(ang / 2);
+    t = Math.min(t, 0.499 * Math.min(l1, l2));
+    const p1 = cur.clone().addScaledVector(v1, t), p2 = cur.clone().addScaledVector(v2, t);
+    if (mode === 'chamfer') { out.push(p1, p2); continue; }
+    const rr = t * Math.tan(ang / 2);
+    const c = cur.clone().addScaledVector(v1.clone().add(v2).normalize(), rr / Math.sin(ang / 2));
+    const axis = new THREE.Vector3().crossVectors(p1.clone().sub(c), p2.clone().sub(c)).normalize();
+    const sweep = Math.PI - ang, steps = Math.max(3, Math.ceil(sweep / (Math.PI / 2) * 10));
+    const r0 = p1.clone().sub(c);
+    for (let k = 0; k <= steps; k++) out.push(c.clone().add(r0.clone().applyAxisAngle(axis, sweep * k / steps)));
+  }
+  return out;
+}
+
 /* Linhas de exibição: arestas vivas + bordas + contornos nas regiões curvas (no lugar das isocurvas) */
 const _wireCache = new WeakMap();
 function wireGeometry(g) {
@@ -869,7 +977,9 @@ function transformGeom(g, m) {
 }
 function transformMeta(meta, m) {
   if (!meta) return null;
-  return { ...meta, snaps: (meta.snaps || []).map(s => ({ t: s.t, p: toA(toV(s.p).applyMatrix4(m)) })) };
+  const out = { ...meta, snaps: (meta.snaps || []).map(s => ({ t: s.t, p: toA(toV(s.p).applyMatrix4(m)) })) };
+  if (meta.src) out.src = { ...meta.src, m: new THREE.Matrix4().fromArray(meta.src.m).premultiply(m).toArray() };
+  return out;
 }
 function transformedRec(rec, m) {
   const r = { id: nextId++, kind: rec.kind, def: null, geom: null, meta: transformMeta(rec.meta, m), props: { ...rec.props } };
@@ -1730,7 +1840,7 @@ function cancelAll() {
 /* =========================================================
    Comandos
    ========================================================= */
-const last = { radius: 10, radius2: 2, height: 20, ext: 10, pipe: 1, sides: 6, turns: 5, rot: 90, scale: 2, offset: 2, arr: [3, 3, 1], polar: 6, angle: 360, reduce: 50 };
+const last = { fillet: 1, radius: 10, radius2: 2, height: 20, ext: 10, pipe: 1, sides: 6, turns: 5, rot: 90, scale: 2, offset: 2, arr: [3, 3, 1], polar: 6, angle: 360, reduce: 50 };
 const cpA = () => (activeVP || viewports[0]).cp;
 const addCurve = (def, props) => addRec(curveRec(def, props));
 const addMesh = (g, meta, props) => addRec(meshRec(g, meta, props));
@@ -1971,7 +2081,16 @@ cmd('Extrudar', { label: 'Extrudar curva', alias: ['ExtrudeCrv', 'Extrude'], cat
   }
   if (Math.abs(dist) < 1e-9) throw new Error('Distância zero.');
   last.ext = dist;
-  for (const it of items) addMesh(extrudeCurvePts(it.S, it.dir.clone().multiplyScalar(dist), it.closed, solid && it.pl && it.pl.planar, it.pl && it.pl.n), null, { layer: it.r.props.layer });
+  for (const it of items) {
+    const isSolidX = solid && it.closed && it.pl && it.pl.planar;
+    let meta = null;
+    if (isSolidX) {
+      const zd = it.dir.clone().multiplyScalar(Math.sign(dist)), bx = basisFromNormal(zd), o = it.S[0];
+      const pts = it.r.def.type === 'polyline' ? it.r.def.pts.map(toV) : it.S.slice(0, -1);
+      meta = { solid: true, src: { type: 'prism', prof: pts.map(p => { const d = p.clone().sub(o); return [d.dot(bx.x), d.dot(bx.y)]; }), h: Math.abs(dist), m: new THREE.Matrix4().makeBasis(bx.x, bx.y, zd).setPosition(o).toArray() } };
+    }
+    addMesh(extrudeCurvePts(it.S, it.dir.clone().multiplyScalar(dist), it.closed, isSolidX, it.pl && it.pl.n), meta, { layer: it.r.props.layer });
+  }
 });
 cmd('Revolucao', { label: 'Revolução', alias: ['Revolve'], cat: 'Superfície', icon: 'revolve', desc: 'Gira um perfil em torno de um eixo (vasos, garrafas, anéis).' }, async () => {
   const crvs = await getObjects('Selecione as curvas de perfil', isCurve);
@@ -2044,7 +2163,9 @@ cmd('Caixa', { alias: ['Box'], cat: 'Sólido', icon: 'box', desc: 'Caixa por doi
   if (Math.abs(h) < 1e-9) throw new Error('Altura zero.');
   const ez = cp.n.clone().multiplyScalar(h);
   const ctr = a.clone().addScaledVector(ex, 0.5).addScaledVector(ey, 0.5).addScaledVector(ez, 0.5);
-  addMesh(makeBox(a, ex, ey, ez), { snaps: [{ t: 'cen', p: toA(ctr) }] });
+  const fr = new THREE.Matrix4().makeBasis(cp.x.clone().multiplyScalar(Math.sign(dx)), cp.y.clone().multiplyScalar(Math.sign(dy)), cp.n.clone().multiplyScalar(Math.sign(h))).setPosition(a);
+  const W = Math.abs(dx), D = Math.abs(dy);
+  addMesh(makeBox(a, ex, ey, ez), { snaps: [{ t: 'cen', p: toA(ctr) }], solid: true, src: { type: 'prism', prof: [[0, 0], [W, 0], [W, D], [0, D]], h: Math.abs(h), m: fr.toArray() } });
   res(`Caixa ${fmt(Math.abs(dx))} × ${fmt(Math.abs(dy))} × ${fmt(Math.abs(h))}`);
 });
 cmd('Esfera', { alias: ['Sphere'], cat: 'Sólido', icon: 'sphere', desc: 'Esfera por centro e raio.' }, async () => {
@@ -2061,7 +2182,10 @@ cmd('Cilindro', { alias: ['Cylinder'], cat: 'Sólido', icon: 'cylinder', desc: '
   const h = await getNumber('Altura', last.height, { base: c, line: { base: c, dir: cp.n }, preview: v => Math.abs(v) > 1e-9 && tmpMesh(makeCylinder(c, cp.n, r, v, r, 40)) });
   if (r < 1e-9 || Math.abs(h) < 1e-9) throw new Error('Dimensão zero.');
   last.radius = r; last.height = h;
-  addMesh(makeCylinder(c, cp.n, r, h), { snaps: [{ t: 'cen', p: toA(c) }, { t: 'cen', p: toA(c.clone().addScaledVector(cp.n, h)) }] });
+  const zd = cp.n.clone().multiplyScalar(Math.sign(h)), bx = basisFromNormal(zd);
+  const circ = []; for (let i = 0; i < 72; i++) { const t = TAU * i / 72; circ.push([r * Math.cos(t), r * Math.sin(t)]); }
+  addMesh(makeCylinder(c, cp.n, r, h), { snaps: [{ t: 'cen', p: toA(c) }, { t: 'cen', p: toA(c.clone().addScaledVector(cp.n, h)) }], solid: true,
+    src: { type: 'prism', prof: circ, h: Math.abs(h), m: new THREE.Matrix4().makeBasis(bx.x, bx.y, zd).setPosition(c).toArray() } });
 });
 cmd('Cone', { alias: [], cat: 'Sólido', icon: 'cone', desc: 'Cone por centro da base, raio e ápice.' }, async () => {
   const cp = cpA();
@@ -2114,6 +2238,37 @@ cmd('Elipsoide', { label: 'Elipsoide', alias: ['Ellipsoid'], cat: 'Sólido', ico
   addMesh(mk(cc), { snaps: [{ t: 'cen', p: toA(c) }] });
 });
 const isSolid = r => r.kind === 'mesh' && (!!(r.meta && r.meta.solid) || meshIsClosed(r.geom).closed);
+const EDGE_SETS = { todas: 'Todas', verticais: 'Laterais', topo: 'Topo e base' };
+cmd('ArredondarArestas', { label: 'Arredondar arestas', alias: ['FilletEdge', 'Fillet', 'Filete'], cat: 'Sólido', icon: 'fillet', desc: 'Arredonda as arestas de caixas, cilindros e extrusões de curvas fechadas.' }, async () => {
+  const recs = await getObjects('Selecione caixas, cilindros ou extrusões', r => isMesh(r) && !!(r.meta && r.meta.src));
+  let which = 'todas', rad;
+  for (;;) {
+    const v = await getNumber('Raio do arredondamento', last.fillet, { options: { Arestas: `Arestas=${EDGE_SETS[which]}` } });
+    if (v && v.option) { const ks = Object.keys(EDGE_SETS); which = ks[(ks.indexOf(which) + 1) % ks.length]; continue; }
+    rad = Math.abs(v); break;
+  }
+  last.fillet = rad;
+  for (const r of recs) {
+    const src = r.meta.src;
+    const rv = which === 'topo' ? 0 : rad, rtWanted = which === 'verticais' ? 0 : rad;
+    const { geom, rt } = makePrism(src.prof, src.h, rv, rtWanted, src.m);
+    if (rtWanted > 0 && rt < rtWanted - 1e-6) log(`Raio de topo/base reduzido para ${fmt(rt)} para caber na peça.`, 'err');
+    replaceRec(r, { ...r, id: nextId++, geom, meta: { ...r.meta, solid: true, fillet: { rv, rt } }, props: { ...r.props } });
+  }
+  res(`${recs.length} sólido(s) arredondado(s) com raio ${fmt(rad)}.`);
+});
+async function cornerCmd(mode) {
+  const recs = await getObjects('Selecione polilinhas, retângulos ou polígonos', r => isCurve(r) && r.def.type === 'polyline' && r.def.pts.length > 2);
+  const d = Math.abs(await getNumber(mode === 'fillet' ? 'Raio dos cantos' : 'Distância do chanfro', last.fillet));
+  last.fillet = d;
+  for (const r of recs) {
+    const P = cornerPolyline(r.def.pts.map(toV), !!r.def.closed, d, mode);
+    replaceRec(r, { ...r, id: nextId++, def: { type: 'polyline', pts: P.map(toA), closed: !!r.def.closed }, props: { ...r.props } });
+  }
+  res(`${recs.length} curva(s) ${mode === 'fillet' ? 'arredondada(s)' : 'chanfrada(s)'}.`);
+}
+cmd('ArredondarCantos', { label: 'Arredondar cantos', alias: ['FilletCorners'], cat: 'Curva', icon: 'fillet', desc: 'Troca os cantos de polilinhas por arcos. Depois extrude ou revolucione.' }, () => cornerCmd('fillet'));
+cmd('ChanfrarCantos', { label: 'Chanfrar cantos', alias: ['ChamferCorners', 'Chanfro'], cat: 'Curva', icon: 'chamfer', desc: 'Corta os cantos de polilinhas em linha reta.' }, () => cornerCmd('chamfer'));
 function checkClosed(recs) { const open = recs.filter(r => !isSolid(r)); if (open.length) log(`Atenção: ${open.length} objeto(s) não são sólidos fechados; o resultado pode ficar incompleto.`, 'err'); }
 async function boolCmd(op) {
   let A, B = [];
@@ -2450,6 +2605,7 @@ const ALLOWED_EXT = ['gif', 'png', 'jpg', 'jpeg', 'webp', 'mp4', 'webm', 'txt', 
 const inClaude = !!(window.claude && window.claude.use);
 const dlReady = inClaude ? window.claude.use('downloads').catch(() => null) : Promise.resolve(null);
 async function saveFile(filename, data) {
+  filename = filename.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   let bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data.buffer ? data.buffer.slice(data.byteOffset || 0, (data.byteOffset || 0) + data.byteLength) : data);
   const dl = await dlReady;
   if (inClaude) {
@@ -2493,17 +2649,13 @@ function exportScene(recs, withCurves) {
 async function exportFormat(fmtKey, recs) {
   const base = (doc.name || 'modelo').replace(/[^\wÀ-ú\- ]+/g, '').trim() || 'modelo';
   const meshes = recs.filter(isMesh);
-  if (['stl', 'ply'].includes(fmtKey) && !meshes.length) throw new Error('Não há superfícies ou sólidos para exportar.');
+  if (['stl', 'ply', '3mf'].includes(fmtKey) && !meshes.length) throw new Error('Não há superfícies ou sólidos para exportar.');
   if (fmtKey === 'json') return saveFile(`${base}.vertice.json`, JSON.stringify(serialize(recs)));
   if (fmtKey === 'obj') {
     const grp = exportScene(recs, true); grp.applyMatrix4(ZUP_TO_YUP); grp.updateMatrixWorld(true);
     return saveFile(`${base}.obj`, new OBJExporter().parse(grp));
   }
-  if (fmtKey === 'stl') {
-    const grp = exportScene(meshes, false); grp.updateMatrixWorld(true);
-    const dv = new STLExporter().parse(grp, { binary: true });
-    return saveFile(`${base}.stl`, new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
-  }
+  if (fmtKey === 'stl' || fmtKey === '3mf') return exportPrint(fmtKey, meshes, base);
   if (fmtKey === 'glb') {
     const grp = exportScene(recs, true); grp.applyMatrix4(ZUP_TO_YUP); grp.updateMatrixWorld(true);
     const buf = await new Promise((ok, bad) => new GLTFExporter().parse(grp, ok, bad, { binary: true }));
@@ -2520,6 +2672,86 @@ async function exportFormat(fmtKey, recs) {
     return saveFile(`${base}.3dm`, bytes);
   }
 }
+/* ---------- impressão 3D ---------- */
+const UNIT_MM = { 'Milímetros': 1, 'Centímetros': 10, 'Metros': 1000, 'Polegadas': 25.4 };
+const OUT_UNITS = { mm: { label: 'mm', mm: 1, tmf: 'millimeter' }, cm: { label: 'cm', mm: 10, tmf: 'centimeter' }, m: { label: 'm', mm: 1000, tmf: 'meter' }, pol: { label: 'pol', mm: 25.4, tmf: 'inch' } };
+const printOpts = { unit: 'mm', scale: 1, ascii: false, split: false };
+const safeName = s => (s || 'objeto').replace(/[^\wÀ-ú\- ]+/g, '').trim().slice(0, 60) || 'objeto';
+function printGeom(r, factor) {
+  let g = new THREE.BufferGeometry(); g.setAttribute('position', r.geom.attributes.position.clone());
+  if (factor !== 1) g.applyMatrix4(new THREE.Matrix4().makeScale(factor, factor, factor));
+  return g;
+}
+async function exportPrint(kind, meshes, base) {
+  for (;;) {
+    const opts = { Unidade: `Unidade=${OUT_UNITS[printOpts.unit].label}`, Escala: `Escala=${fmt(printOpts.scale, 4)}` };
+    if (kind === 'stl') { opts.Formato = `Formato=${printOpts.ascii ? 'Texto' : 'Binário'}`; opts.Separar = `UmArquivoPorObjeto=${yesNo(printOpts.split)}`; }
+    const o = await getOption(`Opções de ${kind.toUpperCase()} (Enter exporta)`, opts);
+    if (!o) break;
+    if (o.option === 'Unidade') { const ks = Object.keys(OUT_UNITS); printOpts.unit = ks[(ks.indexOf(printOpts.unit) + 1) % ks.length]; }
+    else if (o.option === 'Escala') { const v = await getNumber('Fator de escala', printOpts.scale); if (v > 0) printOpts.scale = v; }
+    else if (o.option === 'Formato') printOpts.ascii = !printOpts.ascii;
+    else if (o.option === 'Separar') printOpts.split = !printOpts.split;
+  }
+  const factor = (UNIT_MM[doc.units] || 1) / OUT_UNITS[printOpts.unit].mm * printOpts.scale;
+  const open = meshes.filter(r => !isSolid(r));
+  if (open.length) log(`Atenção: ${open.length} objeto(s) não são sólidos fechados e podem falhar no fatiador. Use VerificarImpressao.`, 'err');
+  const s = recsBox(meshes).getSize(V()).multiplyScalar(factor);
+  log(`Tamanho exportado: ${fmt(s.x, 2)} × ${fmt(s.y, 2)} × ${fmt(s.z, 2)} ${OUT_UNITS[printOpts.unit].label}`, 'res');
+  if (kind === '3mf') return saveFile(`${base}.3mf`, build3mf(meshes, factor, OUT_UNITS[printOpts.unit].tmf));
+  const stlOf = recs => {
+    const grp = new THREE.Group();
+    recs.forEach(r => grp.add(new THREE.Mesh(printGeom(r, factor))));
+    grp.updateMatrixWorld(true);
+    const out = new STLExporter().parse(grp, { binary: !printOpts.ascii });
+    return typeof out === 'string' ? new TextEncoder().encode(out) : new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+  };
+  if (printOpts.split && meshes.length > 1) {
+    const files = {}; const used = new Set();
+    meshes.forEach((r, i) => { let n = safeName(r.props.name || `${layerById(r.props.layer).name} ${i + 1}`); while (used.has(n)) n += '_'; used.add(n); files[`${n}.stl`] = stlOf([r]); });
+    return saveFile(`${base} - STL.zip`, zipSync(files));
+  }
+  return saveFile(`${base}.stl`, stlOf(meshes));
+}
+function build3mf(meshes, factor, unit) {
+  const enc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const parts = [];
+  meshes.forEach((r, i) => {
+    let g = printGeom(r, factor); g = mergeVertices(g, 1e-6);
+    const p = g.attributes.position.array, idx = g.index.array;
+    const vs = new Array(p.length / 3), ts = [];
+    for (let k = 0; k < p.length; k += 3) vs[k / 3] = `<vertex x="${+p[k].toFixed(5)}" y="${+p[k + 1].toFixed(5)}" z="${+p[k + 2].toFixed(5)}"/>`;
+    for (let k = 0; k < idx.length; k += 3) { const a = idx[k], b = idx[k + 1], c = idx[k + 2]; if (a !== b && b !== c && a !== c) ts.push(`<triangle v1="${a}" v2="${b}" v3="${c}"/>`); }
+    parts.push(`<object id="${i + 1}" type="model" name="${enc(r.props.name || `Objeto ${i + 1}`)}"><mesh><vertices>${vs.join('')}</vertices><triangles>${ts.join('')}</triangles></mesh></object>`);
+  });
+  const model = `<?xml version="1.0" encoding="UTF-8"?>\n<model unit="${unit}" xml:lang="pt-BR" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><metadata name="Application">Vértice 3D</metadata><resources>${parts.join('')}</resources><build>${meshes.map((_, i) => `<item objectid="${i + 1}"/>`).join('')}</build></model>`;
+  const te = new TextEncoder();
+  return zipSync({
+    '[Content_Types].xml': te.encode('<?xml version="1.0" encoding="UTF-8"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>'),
+    '_rels/.rels': te.encode('<?xml version="1.0" encoding="UTF-8"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>'),
+    '3D/3dmodel.model': te.encode(model),
+  });
+}
+const MATERIALS_PRINT = [['PLA', 1.24], ['PETG', 1.27], ['ABS', 1.04], ['Resina', 1.12]];
+cmd('VerificarImpressao', { label: 'Verificar para impressão', alias: ['PrintCheck', 'Check', 'Verificar'], cat: 'Análise', icon: 'print', desc: 'Confere se as peças estão fechadas, com normais para fora, e estima tamanho, volume e peso.' }, async () => {
+  const recs = await getObjects('Selecione as peças', isMesh);
+  const f = UNIT_MM[doc.units] || 1;
+  let okAll = true;
+  for (const r of recs) {
+    const nm = r.props.name || `objeto ${r.id}`;
+    const info = meshIsClosed(r.geom), solid = isSolid(r), vol = meshVolume(r.geom);
+    const s = recBox(r).getSize(V()).multiplyScalar(f);
+    const issues = [];
+    if (!solid) issues.push(`aberta (${info.naked} arestas soltas): o fatiador pode falhar; feche com Tampar/Extrudar sólido`);
+    if (solid && vol < 0) issues.push('normais para dentro: use Inverter');
+    if (Math.min(s.x, s.y, s.z) < 0.4) issues.push(`espessura mínima de ${fmt(Math.min(s.x, s.y, s.z), 2)} mm é fina demais para FDM`);
+    const vcm = Math.abs(vol) * f * f * f / 1000;
+    log(`${nm}: ${fmt(s.x, 2)} × ${fmt(s.y, 2)} × ${fmt(s.z, 2)} mm · volume ${fmt(vcm, 2)} cm³ · ${MATERIALS_PRINT.map(([m, d]) => `${m} ≈ ${fmt(vcm * d, 1)} g`).join(' · ')} (peças maciças)`, 'res');
+    if (issues.length) { okAll = false; issues.forEach(t => log(`  ✗ ${t}`, 'err')); } else log('  ✓ fechada e orientada corretamente', 'ok');
+  }
+  toast(okAll ? 'Peças prontas para impressão.' : 'Algumas peças precisam de ajustes; veja a linha de comando.');
+});
+
 function build3dm(rh, recs) {
   const f = new rh.File3dm();
   const layerIdx = new Map();
@@ -2628,6 +2860,7 @@ async function importFile(file, replace) {
   let n = 0;
   if (ext === 'obj') n = importMeshesFromObject(new OBJLoader().parse(await file.text()), true, props);
   else if (ext === 'stl') { addRec(meshRec(finalizeGeom(new STLLoader().parse(await file.arrayBuffer())), null, props)); n = 1; }
+  else if (ext === '3mf') n = importMeshesFromObject(new ThreeMFLoader().parse(await file.arrayBuffer()), false, props);
   else if (ext === 'ply') { addRec(meshRec(finalizeGeom(new PLYLoader().parse(await file.arrayBuffer())), null, props)); n = 1; }
   else if (ext === 'glb' || ext === 'gltf') {
     const buf = ext === 'glb' ? await file.arrayBuffer() : await file.text();
@@ -2639,7 +2872,7 @@ async function importFile(file, replace) {
     const r = read3dm(rh, await file.arrayBuffer(), stem);
     n = r.n; if (r.skipped) log(`${r.skipped} objeto(s) sem malha de renderização foram ignorados. No Rhino, salve com "Salvar malhas de renderização" ligado.`, 'err');
     doc.current = doc.layers[doc.layers.length - 1]?.id || doc.current;
-  } else throw new Error(`Formato .${ext} não suportado. Use .json, .obj, .stl, .glb, .gltf, .ply ou .3dm.`);
+  } else throw new Error(`Formato .${ext} não suportado. Use .json, .obj, .stl, .3mf, .glb, .gltf, .ply ou .3dm.`);
   refreshLayers();
   res(`${n} objeto(s) importado(s) de ${file.name}.`);
   setTimeout(() => viewports.forEach(v => v.zoomExtents(visBox())), 0);
@@ -2664,20 +2897,20 @@ cmd('Novo', { alias: ['New'], cat: 'Arquivo', icon: 'new', desc: 'Começa um mod
   viewports.forEach(v => v.zoomExtents(null));
 });
 cmd('Abrir', { alias: ['Open'], cat: 'Arquivo', icon: 'open', desc: 'Abre um modelo (.json do Vértice) ou um arquivo 3D.', noRepeat: true, key: 'Ctrl+O' }, async () => {
-  const file = await pickFile('.json,.obj,.stl,.glb,.gltf,.ply,.3dm');
+  const file = await pickFile('.json,.obj,.stl,.3mf,.glb,.gltf,.ply,.3dm');
   log('Lendo…'); await importFile(file, true);
 });
-cmd('Importar', { alias: ['Import'], cat: 'Arquivo', icon: 'import', desc: 'Adiciona objetos de OBJ, STL, GLB/GLTF, PLY, 3DM ou outro modelo do Vértice.', noRepeat: true }, async () => {
-  const file = await pickFile('.json,.obj,.stl,.glb,.gltf,.ply,.3dm');
+cmd('Importar', { alias: ['Import'], cat: 'Arquivo', icon: 'import', desc: 'Adiciona objetos de OBJ, STL, 3MF, GLB/GLTF, PLY, 3DM ou outro modelo do Vértice.', noRepeat: true }, async () => {
+  const file = await pickFile('.json,.obj,.stl,.3mf,.glb,.gltf,.ply,.3dm');
   log('Lendo…'); await importFile(file, false);
 });
 cmd('Salvar', { alias: ['Save'], cat: 'Arquivo', icon: 'save', desc: 'Baixa o modelo completo no formato do Vértice (.json).', noRepeat: true, key: 'Ctrl+S' }, async () => {
   await exportFormat('json', doc.objects);
 });
-cmd('Exportar', { alias: ['Export'], cat: 'Arquivo', icon: 'export', desc: 'Exporta a seleção (ou tudo) para OBJ, STL, GLB, PLY ou 3DM.', noRepeat: true }, async () => {
+cmd('Exportar', { alias: ['Export'], cat: 'Arquivo', icon: 'export', desc: 'Exporta a seleção (ou tudo) para STL, 3MF, OBJ, GLB, PLY ou 3DM.', noRepeat: true }, async () => {
   const recs = selectedRecs().length ? selectedRecs() : doc.objects.filter(isVisible);
   if (!recs.length) throw new Error('Nada para exportar.');
-  const o = await getOption(`Formato (${recs.length} objeto${recs.length > 1 ? 's' : ''})`, { STL: 'STL (impressão 3D)', OBJ: 'OBJ', GLB: 'GLB (web/AR)', PLY: 'PLY', '3DM': '3DM (Rhino)', JSON: 'Vértice' }, 'STL');
+  const o = await getOption(`Formato (${recs.length} objeto${recs.length > 1 ? 's' : ''})`, { STL: 'STL (impressão 3D)', '3MF': '3MF (impressão 3D)', OBJ: 'OBJ', GLB: 'GLB (web/AR)', PLY: 'PLY', '3DM': '3DM (Rhino)', JSON: 'Vértice' }, 'STL');
   if (!o) return;
   log('Exportando…');
   await exportFormat(o.option.toLowerCase(), recs);
@@ -2788,6 +3021,9 @@ const ICONS = {
   unlock: '<rect x="5" y="11" width="14" height="10" rx="1.5"/><path d="M8 11V8a4 4 0 0 1 7.5-2"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   panel: '<rect x="3" y="4" width="18" height="16" rx="1.5"/><path d="M15 4v16"/>',
+  fillet: '<path d="M4 20V11a7 7 0 0 1 7-7h9"/><path d="M4 4h7M4 4v7" stroke-dasharray="2 2" opacity=".5"/>',
+  chamfer: '<path d="M4 20V10l6-6h10"/><path d="M4 4h6M4 4v6" stroke-dasharray="2 2" opacity=".5"/>',
+  print: '<path d="M4 3h16v4H4zM9 7v3l3 2.5L15 10V7"/><path d="M4 21h16M7 17.5h10"/>',
   mesh: '<path d="M3 19 12 4l9 15z"/><path d="M7.5 11.5h9M12 19 7.5 11.5M12 19l4.5-7.5"/>',
 };
 const svg = (name, cls = '') => `<svg viewBox="0 0 24 24" class="${cls}" aria-hidden="true">${ICONS[name] || ICONS.info}</svg>`;
@@ -2822,12 +3058,12 @@ const MENUS = [
   ['Arquivo', ['Novo', 'Abrir', 'Salvar', '-', 'Importar', 'Exportar', '-', 'Captura']],
   ['Editar', ['Desfazer', 'Refazer', '-', 'Excluir', 'SelTudo', 'SelNenhum', 'InverterSel', 'SelUltimo', '-', 'SelCurvas', 'SelSuperficies', 'SelSolidos', 'SelPontos', '-', 'Ocultar', 'MostrarTudo', 'Bloquear', 'Desbloquear', '-', 'MudarCamada', 'Propriedades']],
   ['Vista', ['ZoomTudo', 'ZoomTodasVistas', 'ZoomSelecao', '-', 'ModoAramado', 'ModoSombreado', 'ModoRenderizado', 'ModoFantasma', 'ModoRaioX', '-', 'VistaSuperior', 'VistaFrontal', 'VistaDireita', 'VistaPerspectiva', 'VistaInferior', 'VistaTraseira', 'VistaEsquerda', '-', 'Maximizar', 'QuatroVistas', 'Grade']],
-  ['Curva', ['Ponto', 'Pontos', 'Linha', 'Polilinha', 'Curva', 'CurvaInterp', '-', 'Circulo', 'Arco', 'Elipse', 'Retangulo', 'Poligono', 'Helice', '-', 'Deslocar', 'Unir', 'Explodir', 'Inverter']],
+  ['Curva', ['Ponto', 'Pontos', 'Linha', 'Polilinha', 'Curva', 'CurvaInterp', '-', 'Circulo', 'Arco', 'Elipse', 'Retangulo', 'Poligono', 'Helice', '-', 'Deslocar', 'ArredondarCantos', 'ChanfrarCantos', 'Unir', 'Explodir', 'Inverter']],
   ['Superfície', ['Extrudar', 'Revolucao', 'Loft', 'Varredura', 'Tubo', '-', 'SuperficiePlana', 'SrfPt', 'Plano']],
-  ['Sólido', ['Caixa', 'Esfera', 'Cilindro', 'Cone', 'TroncoCone', 'Toro', 'Piramide', 'Elipsoide', '-', 'UniaoBooleana', 'DiferencaBooleana', 'IntersecaoBooleana']],
+  ['Sólido', ['Caixa', 'Esfera', 'Cilindro', 'Cone', 'TroncoCone', 'Toro', 'Piramide', 'Elipsoide', '-', 'ArredondarArestas', '-', 'UniaoBooleana', 'DiferencaBooleana', 'IntersecaoBooleana']],
   ['Malha', ['SuavizarNormais', 'Facetar', 'ReduzirMalha', 'Inverter']],
   ['Transf.', ['Mover', 'Copiar', 'Girar', 'Girar3D', 'Escalar', 'Escalar1D', 'Escalar2D', 'Espelhar', 'Matriz', 'MatrizPolar', '-', 'Gumball']],
-  ['Análise', ['Distancia', 'Comprimento', 'Area', 'Volume', 'CaixaDelimitadora', 'Info']],
+  ['Análise', ['Distancia', 'Comprimento', 'Area', 'Volume', 'CaixaDelimitadora', 'Info', '-', 'VerificarImpressao']],
   ['Ferramentas', ['Camadas', 'Orto', 'SnapGrade', 'Osnap', 'Opcoes']],
   ['Ajuda', ['Ajuda']],
 ];
@@ -2884,11 +3120,11 @@ function openViewMenu(vp, anchor) {
 const TOP_TOOLS = [['Novo', 'new'], ['Abrir', 'open'], ['Salvar', 'save'], ['Importar', 'import'], ['Exportar', 'export'], '|', ['Desfazer', 'undo'], ['Refazer', 'redo'], '|', ['ZoomTudo', 'zoomext'], ['ZoomSelecao', 'zoomsel'], '|',
   ['ModoAramado', 'wire', 'mode:wire'], ['ModoSombreado', 'shaded', 'mode:shaded'], ['ModoRenderizado', 'rendered', 'mode:rendered'], ['ModoFantasma', 'ghost', 'mode:ghost'], ['ModoRaioX', 'xray', 'mode:xray'], '|',
   ['Gumball', 'gumball', 'gumball'], ['Orto', 'ortho', 'ortho'], ['Captura', 'capture'], '|', ['Camadas', 'layers'], ['Ajuda', 'help']];
-const RAIL = [['Curvas', ['Ponto', 'Linha', 'Polilinha', 'Curva', 'CurvaInterp', 'Circulo', 'Arco', 'Elipse', 'Retangulo', 'Poligono', 'Helice', 'Deslocar', 'Unir', 'Explodir']],
+const RAIL = [['Curvas', ['Ponto', 'Linha', 'Polilinha', 'Curva', 'CurvaInterp', 'Circulo', 'Arco', 'Elipse', 'Retangulo', 'Poligono', 'Helice', 'Deslocar', 'ArredondarCantos', 'Unir', 'Explodir']],
   ['Superf.', ['Extrudar', 'Revolucao', 'Loft', 'Varredura', 'Tubo', 'SuperficiePlana', 'SrfPt', 'Plano']],
-  ['Sólidos', ['Caixa', 'Esfera', 'Cilindro', 'Cone', 'Toro', 'Piramide', 'Elipsoide', 'TroncoCone', 'UniaoBooleana', 'DiferencaBooleana', 'IntersecaoBooleana', 'Inverter']],
+  ['Sólidos', ['Caixa', 'Esfera', 'Cilindro', 'Cone', 'Toro', 'Piramide', 'Elipsoide', 'TroncoCone', 'ArredondarArestas', 'UniaoBooleana', 'DiferencaBooleana', 'IntersecaoBooleana', 'Inverter']],
   ['Transf.', ['Mover', 'Copiar', 'Girar', 'Escalar', 'Escalar1D', 'Espelhar', 'Matriz', 'MatrizPolar', 'Excluir']],
-  ['Análise', ['Distancia', 'Comprimento', 'Area', 'Volume', 'CaixaDelimitadora', 'Info']]];
+  ['Análise', ['Distancia', 'Comprimento', 'Area', 'Volume', 'CaixaDelimitadora', 'Info', 'VerificarImpressao']]];
 function iconButton(c, icon, extra) {
   const b = document.createElement('button'); b.type = 'button'; b.className = 'ib';
   b.title = `${c.label}${c.alias.length ? ` (${c.alias[0]})` : ''}${c.key ? ` · ${c.key}` : ''}\n${c.desc}`;
@@ -3156,7 +3392,7 @@ function buildSample() {
   const vase = revolvePts(sampleCurve(profRec.def), axisA, axisB, 360);
   addRec(meshRec(vase, { snaps: [{ t: 'cen', p: toA(axisA) }] }, { layer: L('Superfícies'), name: 'Vaso', material: 'ceramica', matColor: '#2f6f8f' }));
   // bloco com furo (diferença booleana)
-  const blk = makeBox(V(-12, -15, 0), V(30, 0, 0), V(0, 30, 0), V(0, 0, 14));
+  const blk = makePrism([[0, 0], [30, 0], [30, 30], [0, 30]], 14, 3, 1.5, new THREE.Matrix4().makeTranslation(-12, -15, 0).toArray()).geom;
   const hole = makeCylinder(V(3, 0, -2), V(0, 0, 1), 8, 18);
   const g = booleanOp([blk], [hole], SUBTRACTION) || blk;
   addRec(meshRec(g, { solid: true, snaps: [{ t: 'cen', p: [3, 0, 14] }] }, { layer: L('Sólidos'), name: 'Bloco com furo', material: 'metal' }));
